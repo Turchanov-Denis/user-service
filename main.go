@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"hash/fnv"
 	"log"
 	"net/http"
 	"strings"
@@ -12,86 +13,147 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const shardCount = 128
+const shardCount = 100
 
 type User struct {
-	ID     string
-	Name   string
-	Avatar []byte
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Avatar []byte `json:"avatar"`
 }
 
-type shard struct {
-	mu   sync.RWMutex
-	m    map[string]User
-	keys []string
-	max  int
+type node struct {
+	key   string
+	value User
+	prev  *node
+	next  *node
 }
 
-type ShardedCache struct {
-	shards [shardCount]*shard
+type LRUCache struct {
+	capacity int
+	items    map[string]*node
+	head     *node
+	tail     *node
+	mutex    sync.Mutex
 }
 
-func NewCache(maxPerShard int) *ShardedCache {
-	c := &ShardedCache{}
-
-	for i := 0; i < shardCount; i++ {
-		c.shards[i] = &shard{
-			m:    make(map[string]User),
-			max:  maxPerShard,
-			keys: make([]string, 0, maxPerShard),
-		}
+func NewLRUCache(capacity int) *LRUCache {
+	return &LRUCache{
+		capacity: capacity,
+		items:    make(map[string]*node),
 	}
-
-	return c
 }
 
-func fnv32(s string) uint32 {
-	var h uint32 = 2166136261
-	for i := 0; i < len(s); i++ {
-		h ^= uint32(s[i])
-		h *= 16777619
+func (c *LRUCache) Get(key string) (User, bool) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if n, ok := c.items[key]; ok {
+		c.moveToFront(n)
+		return n.value, true
 	}
-	return h
+	return User{}, false
 }
 
-func (c *ShardedCache) getShard(key string) *shard {
-	return c.shards[fnv32(key)%shardCount]
-}
+func (c *LRUCache) Put(key string, value User) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 
-func (c *ShardedCache) Get(key string) (User, bool) {
-	s := c.getShard(key)
-
-	s.mu.RLock()
-	u, ok := s.m[key]
-	s.mu.RUnlock()
-
-	return u, ok
-}
-
-func (c *ShardedCache) Put(key string, u User) {
-	s := c.getShard(key)
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if _, ok := s.m[key]; ok {
-		s.m[key] = u
+	if n, ok := c.items[key]; ok {
+		n.value = value
+		c.moveToFront(n)
 		return
 	}
 
-	s.m[key] = u
-	s.keys = append(s.keys, key)
+	n := &node{key: key, value: value}
+	c.items[key] = n
+	c.addToFront(n)
 
-	if len(s.m) > s.max {
-		oldKey := s.keys[0]
-		s.keys = s.keys[1:]
-		delete(s.m, oldKey)
+	if len(c.items) > c.capacity {
+		c.removeOldest()
 	}
+}
+
+func (c *LRUCache) moveToFront(n *node) {
+	c.remove(n)
+	c.addToFront(n)
+}
+
+func (c *LRUCache) addToFront(n *node) {
+	n.prev = nil
+	n.next = c.head
+	if c.head != nil {
+		c.head.prev = n
+	}
+	c.head = n
+	if c.tail == nil {
+		c.tail = n
+	}
+}
+
+func (c *LRUCache) remove(n *node) {
+	if n.prev != nil {
+		n.prev.next = n.next
+	} else {
+		c.head = n.next
+	}
+
+	if n.next != nil {
+		n.next.prev = n.prev
+	} else {
+		c.tail = n.prev
+	}
+
+	n.prev = nil
+	n.next = nil
+}
+
+func (c *LRUCache) removeOldest() {
+	if c.tail == nil {
+		return
+	}
+	oldest := c.tail
+	c.remove(oldest)
+	delete(c.items, oldest.key)
+}
+
+type ShardedLRU struct {
+	shards [shardCount]*LRUCache
+}
+
+func NewShardedLRU(capacity int) *ShardedLRU {
+	perShard := capacity / shardCount
+	if perShard == 0 {
+		perShard = 1
+	}
+
+	c := &ShardedLRU{}
+	for i := 0; i < shardCount; i++ {
+		c.shards[i] = NewLRUCache(perShard)
+	}
+	return c
+}
+
+func fnv32(key string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return h.Sum32()
+}
+
+func (c *ShardedLRU) getShard(key string) *LRUCache {
+	return c.shards[fnv32(key)%shardCount]
+}
+
+func (c *ShardedLRU) Get(key string) (User, bool) {
+	return c.getShard(key).Get(key)
+}
+
+func (c *ShardedLRU) Put(key string, value User) {
+	c.getShard(key).Put(key, value)
 }
 
 var (
 	db              *sql.DB
-	cache           = NewCache(1000)
+	cache           = NewShardedLRU(1000)
 	stmtInsertUser  *sql.Stmt
 	stmtGetUserByID *sql.Stmt
 )
@@ -204,6 +266,7 @@ func timingMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	initDB()
+	defer db.Close()
 
 	srv := &http.Server{
 		Addr:         "127.0.0.1:8080",
