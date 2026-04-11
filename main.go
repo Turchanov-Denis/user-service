@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
 	"log"
 	"net/http"
@@ -251,25 +252,68 @@ func router() http.Handler {
 		}
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
-	return timingMiddleware(mux)
+	return mux
 }
 
-func timingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
+//	func timingMiddleware(next http.Handler) http.Handler {
+//		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+//			start := time.Now()
+//
+//			next.ServeHTTP(w, r)
+//
+//			log.Printf("%s %s took %v mc", r.Method, r.URL.Path, time.Since(start).Microseconds())
+//		})
+//	}
 
-		next.ServeHTTP(w, r)
+func preloadUsers() {
+	rows, err := db.Query("SELECT id, name, avatar FROM users")
+	if err != nil {
+		log.Println("[preload] query error:", err)
+		return
+	}
+	defer rows.Close()
 
-		log.Printf("%s %s took %v mc", r.Method, r.URL.Path, time.Since(start).Microseconds())
-	})
+	var count int
+
+	for rows.Next() {
+		var u User
+		if err := rows.Scan(&u.ID, &u.Name, &u.Avatar); err != nil {
+			continue
+		}
+		cache.Put(u.ID, u)
+		count++
+	}
+	log.Printf("preload %d users into cache\n", count)
 }
+func seedFakeUsers(n int) {
+	log.Printf("inserting %d fake users\n", n)
 
+	for i := 1; i <= n; i++ {
+		id := fmt.Sprintf("%d", i)
+		name := fmt.Sprintf("user_%d", i)
+
+		avatar := make([]byte, 512)
+		for j := range avatar {
+			avatar[j] = byte(i % 256)
+		}
+
+		_, err := stmtInsertUser.Exec(id, name, avatar)
+		if err != nil {
+			log.Println("[seed] insert error:", err)
+			continue
+		}
+	}
+
+	log.Println("[seed] done")
+}
 func main() {
 	initDB()
+	seedFakeUsers(1000)
+	preloadUsers()
 	defer db.Close()
 
 	srv := &http.Server{
-		Addr:         "127.0.0.1:8080",
+		Addr:         ":8080",
 		Handler:      router(),
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
