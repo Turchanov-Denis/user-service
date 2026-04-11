@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -137,7 +139,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 	if len(u.Avatar) > 20*1024 {
 		http.Error(w, "avatar so large", http.StatusBadRequest)
 	}
-	_, err := db.Exec("INSERT OR REPLACE INTO users(id, name, avatar) VALUES(?, ?, ?)")
+	_, err := db.Exec("INSERT OR REPLACE INTO users(id, name, avatar) VALUES(?, ?, ?)", u.ID, u.Name, u.Avatar)
 
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
@@ -148,7 +150,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func getUser(w http.ResponseWriter, r *http.Request) {
-	id := r.URL.Query().Get("id")
+	id := strings.TrimPrefix(r.URL.Path, "/user/")
 	if id == "" {
 		http.Error(w, "id required", http.StatusBadRequest)
 		return
@@ -172,7 +174,35 @@ func getUser(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(u)
 }
 
+func router() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/user", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			createUser(w, r)
+			return
+		}
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	})
+	mux.HandleFunc("/user/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			getUser(w, r)
+			return
+		}
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	})
+	return mux
+}
+
 func main() {
 	initDB()
 
+	srv := &http.Server{
+		Addr:         "127.0.0.1:8080",
+		Handler:      router(),
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+	}
+	log.Println("Listening on " + srv.Addr)
+	log.Fatal(srv.ListenAndServe())
 }
