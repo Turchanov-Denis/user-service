@@ -15,7 +15,7 @@ import (
 type User struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
-	Avatar string `json:"avatar"`
+	Avatar []byte `json:"avatar"`
 }
 
 type node struct {
@@ -64,7 +64,7 @@ func (c *LRUCache) Put(key string, value User) {
 	c.items[key] = node
 	c.addToFront(node)
 
-	if len(c.items) == c.capacity {
+	if len(c.items) > c.capacity {
 		c.removeOldest()
 	}
 }
@@ -109,8 +109,10 @@ func (c *LRUCache) removeOldest() {
 	delete(c.items, oldest.key)
 }
 
-var db *sql.DB
-var cache = NewLRUCache(1000)
+var (
+	db    *sql.DB
+	cache = NewLRUCache(1000)
+)
 
 func initDB() {
 	var err error
@@ -138,6 +140,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(u.Avatar) > 20*1024 {
 		http.Error(w, "avatar so large", http.StatusBadRequest)
+		return
 	}
 	_, err := db.Exec("INSERT OR REPLACE INTO users(id, name, avatar) VALUES(?, ?, ?)", u.ID, u.Name, u.Avatar)
 
@@ -164,10 +167,12 @@ func getUser(w http.ResponseWriter, r *http.Request) {
 	var u User
 	err := db.QueryRow("SELECT id, name, avatar FROM users WHERE id = ?", id).Scan(&u.ID, &u.Name, &u.Avatar)
 	if err == sql.ErrNoRows {
-		http.NotFound(w, r)
+		http.Error(w, "id not exist", http.StatusBadRequest)
+		return
 	}
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
+		return
 	}
 	cache.Put(id, u)
 	w.Header().Set("Content-Type", "application/json")
@@ -191,7 +196,17 @@ func router() http.Handler {
 		}
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
-	return mux
+	return timingMiddleware(mux)
+}
+
+func timingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		next.ServeHTTP(w, r)
+
+		log.Printf("%s %s took %v mc", r.Method, r.URL.Path, time.Since(start).Microseconds())
+	})
 }
 
 func main() {
