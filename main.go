@@ -3,7 +3,6 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"hash/fnv"
 	"log"
 	"net/http"
@@ -154,7 +153,7 @@ func (c *ShardedLRU) Put(key string, value User) {
 
 var (
 	db              *sql.DB
-	cache           = NewShardedLRU(1000)
+	cache           = NewShardedLRU(5000)
 	stmtInsertUser  *sql.Stmt
 	stmtGetUserByID *sql.Stmt
 )
@@ -255,16 +254,6 @@ func router() http.Handler {
 	return mux
 }
 
-//	func timingMiddleware(next http.Handler) http.Handler {
-//		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-//			start := time.Now()
-//
-//			next.ServeHTTP(w, r)
-//
-//			log.Printf("%s %s took %v mc", r.Method, r.URL.Path, time.Since(start).Microseconds())
-//		})
-//	}
-
 func preloadUsers() {
 	rows, err := db.Query("SELECT id, name, avatar FROM users")
 	if err != nil {
@@ -285,30 +274,17 @@ func preloadUsers() {
 	}
 	log.Printf("preload %d users into cache\n", count)
 }
-func seedFakeUsers(n int) {
-	log.Printf("inserting %d fake users\n", n)
 
-	for i := 1; i <= n; i++ {
-		id := fmt.Sprintf("%d", i)
-		name := fmt.Sprintf("user_%d", i)
-
-		avatar := make([]byte, 512)
-		for j := range avatar {
-			avatar[j] = byte(i % 256)
-		}
-
-		_, err := stmtInsertUser.Exec(id, name, avatar)
-		if err != nil {
-			log.Println("[seed] insert error:", err)
-			continue
-		}
-	}
-
-	log.Println("[seed] done")
-}
 func main() {
 	initDB()
-	seedFakeUsers(1000)
+	empty, err := isUsersTableEmpty(db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if empty {
+		seedFakeUsers(db, stmtInsertUser, 1000)
+	}
+
 	preloadUsers()
 	defer db.Close()
 
