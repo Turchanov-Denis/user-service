@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"github.com/klauspost/compress/gzip"
 	"hash/fnv"
 	"log"
 	"net/http"
@@ -257,6 +258,42 @@ func getUser(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, u)
 }
 
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	Writer *gzip.Writer
+}
+
+func (w gzipResponseWriter) Write(b []byte) (int, error) {
+	return w.Writer.Write(b)
+}
+
+func gzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Del("Content-Length")
+
+		gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		defer gz.Close()
+
+		gzw := gzipResponseWriter{
+			ResponseWriter: w,
+			Writer:         gz,
+		}
+
+		next.ServeHTTP(gzw, r)
+	})
+}
 func router() http.Handler {
 	mux := http.NewServeMux()
 
@@ -276,7 +313,7 @@ func router() http.Handler {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
 
-	return mux
+	return gzipMiddleware(mux)
 }
 
 func preloadUsers() {
