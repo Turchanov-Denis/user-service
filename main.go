@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"hash/fnv"
@@ -126,11 +127,11 @@ func NewShardedLRU(capacity int) *ShardedLRU {
 		perShard = 1
 	}
 
-	c := &ShardedLRU{}
+	s := &ShardedLRU{}
 	for i := 0; i < shardCount; i++ {
-		c.shards[i] = NewLRUCache(perShard)
+		s.shards[i] = NewLRUCache(perShard)
 	}
-	return c
+	return s
 }
 
 func fnv32(key string) uint32 {
@@ -139,16 +140,16 @@ func fnv32(key string) uint32 {
 	return h.Sum32()
 }
 
-func (c *ShardedLRU) getShard(key string) *LRUCache {
-	return c.shards[fnv32(key)%shardCount]
+func (s *ShardedLRU) getShard(key string) *LRUCache {
+	return s.shards[fnv32(key)%shardCount]
 }
 
-func (c *ShardedLRU) Get(key string) (User, bool) {
-	return c.getShard(key).Get(key)
+func (s *ShardedLRU) Get(key string) (User, bool) {
+	return s.getShard(key).Get(key)
 }
 
-func (c *ShardedLRU) Put(key string, value User) {
-	c.getShard(key).Put(key, value)
+func (s *ShardedLRU) Put(key string, value User) {
+	s.getShard(key).Put(key, value)
 }
 
 var (
@@ -156,6 +157,12 @@ var (
 	cache           = NewShardedLRU(5000)
 	stmtInsertUser  *sql.Stmt
 	stmtGetUserByID *sql.Stmt
+
+	bufPool = sync.Pool{
+		New: func() any {
+			return new(bytes.Buffer)
+		},
+	}
 )
 
 func initDB() {
@@ -172,14 +179,29 @@ func initDB() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	stmtGetUserByID, err = db.Prepare("SELECT id, name, avatar FROM users WHERE id = ?")
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	stmtInsertUser, err = db.Prepare("INSERT OR REPLACE INTO users(id, name, avatar) VALUES(?, ?, ?)")
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
+	_ = json.NewEncoder(buf).Encode(v)
+
+	w.Write(buf.Bytes())
+
+	bufPool.Put(buf)
 }
 
 func createUser(w http.ResponseWriter, r *http.Request) {
@@ -197,12 +219,13 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "avatar so large", http.StatusBadRequest)
 		return
 	}
-	_, err := stmtInsertUser.Exec(u.ID, u.Name, u.Avatar)
 
+	_, err := stmtInsertUser.Exec(u.ID, u.Name, u.Avatar)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
+
 	cache.Put(u.ID, u)
 	w.WriteHeader(http.StatusCreated)
 }
@@ -213,9 +236,9 @@ func getUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "id required", http.StatusBadRequest)
 		return
 	}
+
 	if u, ok := cache.Get(id); ok {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(u)
+		writeJSON(w, u)
 		return
 	}
 
@@ -229,9 +252,9 @@ func getUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
+
 	cache.Put(id, u)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(u)
+	writeJSON(w, u)
 }
 
 func router() http.Handler {
@@ -244,6 +267,7 @@ func router() http.Handler {
 		}
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
+
 	mux.HandleFunc("/user/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			getUser(w, r)
@@ -251,6 +275,7 @@ func router() http.Handler {
 		}
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	})
+
 	return mux
 }
 
@@ -277,6 +302,7 @@ func preloadUsers() {
 
 func main() {
 	initDB()
+
 	empty, err := isUsersTableEmpty(db)
 	if err != nil {
 		log.Fatal(err)
@@ -294,6 +320,7 @@ func main() {
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
 	}
+
 	log.Println("Listening on " + srv.Addr)
 	log.Fatal(srv.ListenAndServe())
 }
