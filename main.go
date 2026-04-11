@@ -12,106 +12,88 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const shardCount = 128
+
 type User struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Avatar []byte `json:"avatar"`
+	ID     string
+	Name   string
+	Avatar []byte
 }
 
-type node struct {
-	key   string
-	value User
-	prev  *node
-	next  *node
+type shard struct {
+	mu   sync.RWMutex
+	m    map[string]User
+	keys []string
+	max  int
 }
 
-type LRUCache struct {
-	capacity int
-	items    map[string]*node
-	head     *node
-	tail     *node
-	mutex    sync.Mutex
+type ShardedCache struct {
+	shards [shardCount]*shard
 }
 
-func NewLRUCache(capacity int) *LRUCache {
-	return &LRUCache{
-		capacity: capacity,
-		items:    make(map[string]*node),
+func NewCache(maxPerShard int) *ShardedCache {
+	c := &ShardedCache{}
+
+	for i := 0; i < shardCount; i++ {
+		c.shards[i] = &shard{
+			m:    make(map[string]User),
+			max:  maxPerShard,
+			keys: make([]string, 0, maxPerShard),
+		}
 	}
+
+	return c
 }
 
-func (c *LRUCache) Get(key string) (User, bool) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	if node, ok := c.items[key]; ok {
-		c.moveToFront(node)
-		return node.value, true
+func fnv32(s string) uint32 {
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
 	}
-	return User{}, false
+	return h
 }
 
-func (c *LRUCache) Put(key string, value User) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
+func (c *ShardedCache) getShard(key string) *shard {
+	return c.shards[fnv32(key)%shardCount]
+}
 
-	if node, ok := c.items[key]; ok {
-		node.value = value
-		c.moveToFront(node)
+func (c *ShardedCache) Get(key string) (User, bool) {
+	s := c.getShard(key)
+
+	s.mu.RLock()
+	u, ok := s.m[key]
+	s.mu.RUnlock()
+
+	return u, ok
+}
+
+func (c *ShardedCache) Put(key string, u User) {
+	s := c.getShard(key)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.m[key]; ok {
+		s.m[key] = u
 		return
 	}
-	node := &node{key: key, value: value}
-	c.items[key] = node
-	c.addToFront(node)
 
-	if len(c.items) > c.capacity {
-		c.removeOldest()
-	}
-}
+	s.m[key] = u
+	s.keys = append(s.keys, key)
 
-func (c *LRUCache) moveToFront(n *node) {
-	c.remove(n)
-	c.addToFront(n)
-}
-
-func (c *LRUCache) addToFront(n *node) {
-	n.next = c.head
-	n.prev = nil
-
-	if c.head != nil {
-		c.head.prev = n
+	if len(s.m) > s.max {
+		oldKey := s.keys[0]
+		s.keys = s.keys[1:]
+		delete(s.m, oldKey)
 	}
-	c.head = n
-
-	if c.tail == nil {
-		c.tail = n
-	}
-}
-
-func (c *LRUCache) remove(n *node) {
-	if n.prev != nil {
-		n.prev.next = n.next
-	} else {
-		c.head = n.next
-	}
-	if n.next != nil {
-		n.next.prev = n.prev
-	} else {
-		c.tail = n.prev
-	}
-}
-func (c *LRUCache) removeOldest() {
-	if c.tail == nil {
-		return
-	}
-	oldest := c.tail
-	c.remove(oldest)
-	delete(c.items, oldest.key)
 }
 
 var (
-	db    *sql.DB
-	cache = NewLRUCache(1000)
+	db              *sql.DB
+	cache           = NewCache(1000)
+	stmtInsertUser  *sql.Stmt
+	stmtGetUserByID *sql.Stmt
 )
 
 func initDB() {
@@ -120,8 +102,19 @@ func initDB() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
 
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT, avatar BLOB)`)
+	if err != nil {
+		log.Fatal(err)
+	}
+	stmtGetUserByID, err = db.Prepare("SELECT id, name, avatar FROM users WHERE id = ?")
+	if err != nil {
+		log.Fatal(err)
+	}
+	stmtInsertUser, err = db.Prepare("INSERT OR REPLACE INTO users(id, name, avatar) VALUES(?, ?, ?)")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -134,7 +127,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if u.ID == "" || len(u.Avatar) == 0 {
+	if u.ID == "" || u.Name == "" || len(u.Avatar) == 0 {
 		http.Error(w, "Invalid input", http.StatusBadRequest)
 		return
 	}
@@ -142,7 +135,7 @@ func createUser(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "avatar so large", http.StatusBadRequest)
 		return
 	}
-	_, err := db.Exec("INSERT OR REPLACE INTO users(id, name, avatar) VALUES(?, ?, ?)", u.ID, u.Name, u.Avatar)
+	_, err := stmtInsertUser.Exec(u.ID, u.Name, u.Avatar)
 
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
@@ -165,7 +158,7 @@ func getUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var u User
-	err := db.QueryRow("SELECT id, name, avatar FROM users WHERE id = ?", id).Scan(&u.ID, &u.Name, &u.Avatar)
+	err := stmtGetUserByID.QueryRow(id).Scan(&u.ID, &u.Name, &u.Avatar)
 	if err == sql.ErrNoRows {
 		http.Error(w, "id not exist", http.StatusBadRequest)
 		return
