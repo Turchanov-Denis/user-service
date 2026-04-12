@@ -1,3 +1,7 @@
+branch(experemental):
+- [x]  sync.Pool, tmp bytes.Buffer for json (merge with main)
+- [ ] json klauspost/compress zstd ( testing )
+
 My Sweden vps(1 core 4 ram ) test 
 utils: https://github.com/grafana/k6
 
