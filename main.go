@@ -1,25 +1,27 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"database/sql"
-	"encoding/json"
 	"hash/fnv"
 	"log"
-	"net/http"
-	"strings"
+	"net"
 	"sync"
-	"time"
 
+	"user-service/user-service/proto"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	_ "modernc.org/sqlite"
 )
 
 const shardCount = 100
 
 type User struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Avatar []byte `json:"avatar"`
+	ID     string
+	Name   string
+	Avatar []byte
 }
 
 type node struct {
@@ -157,12 +159,6 @@ var (
 	cache           = NewShardedLRU(5000)
 	stmtInsertUser  *sql.Stmt
 	stmtGetUserByID *sql.Stmt
-
-	bufPool = sync.Pool{
-		New: func() any {
-			return new(bytes.Buffer)
-		},
-	}
 )
 
 func initDB() {
@@ -191,94 +187,6 @@ func initDB() {
 	}
 }
 
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-
-	_ = json.NewEncoder(buf).Encode(v)
-
-	w.Write(buf.Bytes())
-
-	bufPool.Put(buf)
-}
-
-func createUser(w http.ResponseWriter, r *http.Request) {
-	var u User
-
-	if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	if u.ID == "" || u.Name == "" || len(u.Avatar) == 0 {
-		http.Error(w, "Invalid input", http.StatusBadRequest)
-		return
-	}
-	if len(u.Avatar) > 20*1024 {
-		http.Error(w, "avatar so large", http.StatusBadRequest)
-		return
-	}
-
-	_, err := stmtInsertUser.Exec(u.ID, u.Name, u.Avatar)
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-
-	cache.Put(u.ID, u)
-	w.WriteHeader(http.StatusCreated)
-}
-
-func getUser(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/user/")
-	if id == "" {
-		http.Error(w, "id required", http.StatusBadRequest)
-		return
-	}
-
-	if u, ok := cache.Get(id); ok {
-		writeJSON(w, u)
-		return
-	}
-
-	var u User
-	err := stmtGetUserByID.QueryRow(id).Scan(&u.ID, &u.Name, &u.Avatar)
-	if err == sql.ErrNoRows {
-		http.Error(w, "id not exist", http.StatusBadRequest)
-		return
-	}
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-
-	cache.Put(id, u)
-	writeJSON(w, u)
-}
-
-func router() http.Handler {
-	mux := http.NewServeMux()
-
-	mux.HandleFunc("/user", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost {
-			createUser(w, r)
-			return
-		}
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	})
-
-	mux.HandleFunc("/user/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			getUser(w, r)
-			return
-		}
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	})
-
-	return mux
-}
-
 func preloadUsers() {
 	rows, err := db.Query("SELECT id, name, avatar FROM users")
 	if err != nil {
@@ -300,6 +208,79 @@ func preloadUsers() {
 	log.Printf("preload %d users into cache\n", count)
 }
 
+type GRPCServer struct {
+	proto.UnimplementedUserServiceServer
+}
+
+func (s *GRPCServer) CreateUser(ctx context.Context, req *proto.CreateUserRequest) (*proto.CreateUserResponse, error) {
+	if req.User == nil || req.User.Id == "" || req.User.Name == "" || len(req.User.Avatar) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "id, name and avatar are required")
+	}
+
+	if len(req.User.Avatar) > 20*1024 {
+		return nil, status.Error(codes.InvalidArgument, "avatar too large (max 20KB)")
+	}
+
+	internalUser := User{
+		ID:     req.User.Id,
+		Name:   req.User.Name,
+		Avatar: req.User.Avatar,
+	}
+
+	_, err := stmtInsertUser.Exec(internalUser.ID, internalUser.Name, internalUser.Avatar)
+	if err != nil {
+		log.Printf("db error: %v", err)
+		return nil, status.Error(codes.Internal, "database error")
+	}
+
+	cache.Put(internalUser.ID, internalUser)
+
+	return &proto.CreateUserResponse{
+		Ok:      true,
+		Message: "user created successfully",
+	}, nil
+}
+
+func (s *GRPCServer) GetUser(ctx context.Context, req *proto.GetUserRequest) (*proto.GetUserResponse, error) {
+	if req.Id == "" {
+		return nil, status.Error(codes.InvalidArgument, "id is required")
+	}
+
+	if u, ok := cache.Get(req.Id); ok {
+		return &proto.GetUserResponse{
+			User: &proto.ProtoUser{
+				Id:     u.ID,
+				Name:   u.Name,
+				Avatar: u.Avatar,
+			},
+			Found: true,
+		}, nil
+	}
+
+	var internalUser User
+	err := stmtGetUserByID.QueryRow(req.Id).Scan(&internalUser.ID, &internalUser.Name, &internalUser.Avatar)
+	if err == sql.ErrNoRows {
+		return &proto.GetUserResponse{
+			Found: false,
+		}, nil
+	}
+	if err != nil {
+		log.Printf("db error: %v", err)
+		return nil, status.Error(codes.Internal, "database error")
+	}
+
+	cache.Put(req.Id, internalUser)
+
+	return &proto.GetUserResponse{
+		User: &proto.ProtoUser{
+			Id:     internalUser.ID,
+			Name:   internalUser.Name,
+			Avatar: internalUser.Avatar,
+		},
+		Found: true,
+	}, nil
+}
+
 func main() {
 	initDB()
 
@@ -314,13 +295,17 @@ func main() {
 	preloadUsers()
 	defer db.Close()
 
-	srv := &http.Server{
-		Addr:         ":8080",
-		Handler:      router(),
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
+	grpcServer := grpc.NewServer()
+	//reflection.Register(grpcServer)
+	proto.RegisterUserServiceServer(grpcServer, &GRPCServer{})
+
+	lis, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	log.Println("Listening on " + srv.Addr)
-	log.Fatal(srv.ListenAndServe())
+	log.Println("gRPC server listening on :8080")
+	if err := grpcServer.Serve(lis); err != nil {
+		log.Fatal(err)
+	}
 }
