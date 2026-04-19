@@ -1,14 +1,15 @@
-branch(experemental):
-- [x]  sync.Pool, tmp bytes.Buffer for json (merge with main)
-- [ ] json klauspost/compress zstd ( testing )
+The server in this branch is realized using REST API
 
-My Sweden vps(1 core 4 ram ) test 
+For gRPC realize check branch -> feature/gRPC
+
+
 utils: https://github.com/grafana/k6
 
 ```
 choco install k6
 ```
 
+My Sweden vps
 ```
 
 import http from 'k6/http';
